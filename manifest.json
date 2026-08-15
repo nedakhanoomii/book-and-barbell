@@ -1,6 +1,6 @@
 {
-  "name": "Strength Tracker",
-  "short_name": "Strength",
+  "name": "Book & Barbell",
+  "short_name": "B&B",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#f5f6f8",
