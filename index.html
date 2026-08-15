@@ -4,13 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#2f6feb">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="Book &amp; Barbell">
-<link rel="manifest" href="manifest.json">
-<link rel="apple-touch-icon" href="icon-512.png">
-<title>Book &amp; Barbell</title>
+<title>Strength Tracker</title>
 <style>
 :root{
   --bg:#f5f6f8; --surface:#ffffff; --surface-2:#eceef2; --border:#d8dce3;
@@ -126,7 +120,7 @@ dialog .dlg-head h2{margin:0;font-size:16px;flex:1}
 </head>
 <body>
 <header class="app">
-  <h1>Book &amp; Barbell</h1>
+  <h1>Strength Tracker</h1>
   <span class="sp"></span>
   <button class="btn mini" id="btnExport">Export</button>
   <button class="btn mini" id="btnImport">Import</button>
@@ -1031,7 +1025,7 @@ function exportData(){
   var blob = new Blob([JSON.stringify(out,null,2)], {type:"application/json"});
   var url = URL.createObjectURL(blob);
   var a = document.createElement("a");
-  a.href = url; a.download = "book-and-barbell-" + todayISO() + ".json";
+  a.href = url; a.download = "strength-tracker-" + todayISO() + ".json";
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
   toast("Backup downloaded.");
@@ -1057,7 +1051,7 @@ function importData(){
         state.sets.sort(function(a,b){ return a.date < b.date ? -1 : 1; });
         save(); renderAll();
         toast("Imported " + added + " sets.");
-      }catch(e){ toast("That file didn't look like a Book & Barbell backup."); }
+      }catch(e){ toast("That file didn't look like a Strength Tracker backup."); }
     };
     fr.readAsText(f);
   });
@@ -2104,7 +2098,7 @@ function suggestSwap(exName){
 
 function coachGreeting(){
   $("chatLog").textContent = "";
-  var name = "Athlete";
+  var name = "Neda";
   var n = state.sets.length;
   if(!haveProfile()){
     chatSay("Hi " + name + " — I'm your coach and your training log in one.\n\n" +
