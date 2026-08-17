@@ -122,7 +122,8 @@ dialog .dlg-head h2{margin:0;font-size:16px;flex:1}
   border-radius:999px;padding:6px 11px;font-size:12.5px;cursor:pointer;font-family:inherit}
 .chips button:hover{border-color:var(--accent);color:var(--text)}
 .chatbar{display:flex;gap:8px;padding-block-start:8px;border-block-start:1px solid var(--border)}
-.chatbar input{flex:1}
+.chatbar input,.chatbar textarea{flex:1}
+.chatbar textarea{font:inherit;resize:none;max-height:40vh;overflow-y:auto;line-height:1.4}
 .src{font-size:11px;color:var(--muted);margin-block-start:6px}
 @media print{nav.tabs,header.app .btn,button{display:none!important}}
 </style>
@@ -151,8 +152,8 @@ dialog .dlg-head h2{margin:0;font-size:16px;flex:1}
       <div class="chatlog" id="chatLog"></div>
       <div class="chips" id="chatChips"></div>
       <form class="chatbar" id="chatForm">
-        <input type="text" id="chatIn" placeholder="e.g. 8/3 dumbbell bench press 25 lb for 4 sets of 10"
-               autocomplete="off" autocapitalize="none" autocorrect="off" enterkeyhint="send">
+        <textarea id="chatIn" rows="1" placeholder="e.g. 8/3 dumbbell bench press 25 lb for 4 sets — paste a whole workout, one exercise per line"
+               autocomplete="off" autocapitalize="none" autocorrect="off" enterkeyhint="send"></textarea>
         <button class="btn primary" type="button" id="chatSend">Send</button>
       </form>
     </div>
@@ -1073,7 +1074,7 @@ function importData(){
    phone. Understands set/rep/weight phrasing, questions about your
    history, and routine building.
    =============================================================== */
-var lastBatch = null;
+var lastBatch = [];
 
 var ALIASES = {
   "bench":"Barbell Bench Press","bench press":"Barbell Bench Press",
@@ -1472,7 +1473,7 @@ function undoBatch(){
   state.sets = state.sets.filter(function(s){ return !ids[s.id]; });
   save(); renderAll();
   chatSay("Removed " + (n - state.sets.length) + " set" + ((n-state.sets.length)===1?"":"s") + ".");
-  lastBatch = null;
+  lastBatch = [];
 }
 
 /* Single entry point for every way a message can be sent — the Send button,
@@ -1480,6 +1481,12 @@ function undoBatch(){
    The lock stops one tap being counted twice on browsers that fire both a
    click and a form submit. */
 var sendLock = 0;
+function growChatBox(){
+  var box = $("chatIn");
+  if(!box || box.tagName !== "TEXTAREA") return;
+  box.style.height = "auto";
+  box.style.height = Math.min(box.scrollHeight, Math.round(window.innerHeight*0.4)) + "px";
+}
 function doSend(){
   var now = Date.now();
   if(now - sendLock < 350) return;
@@ -1487,6 +1494,7 @@ function doSend(){
   var v = $("chatIn").value;
   if(!String(v||"").trim()){ $("chatIn").focus(); return; }
   handleChat(v);
+  growChatBox();
 }
 function handleChat(raw){
   var text = String(raw||"").trim();
@@ -1901,6 +1909,15 @@ function weeklyReview(){
 }
 
 function respond(text, t){
+  /* --- a whole workout in one message (multi-line or bulleted list) --- */
+  var wob = parseWorkoutBatch(text);
+  if(wob) return function(){ commitBatch(wob); };
+
+  /* --- fix the reps on what I just logged --- */
+  var mFix = t.match(/(?:make (?:it|them|those)|change (?:it|them|those)?\s*(?:to)?|actually|they were|that was|it was)\s*(\d+)\s*(?:reps?)?\b/);
+  if(mFix && /\brep/.test(t) && lastBatch && lastBatch.length)
+    return (function(n){ return function(){ retagReps(n); }; })(parseInt(mFix[1],10));
+
   /* --- setup / program --- */
   if(/set me up|onboard|coach me|get started|setup|set up|build .*(program|plan)|make .*(program|plan)|rebuild/.test(t)
      && !/routine/.test(t)){
@@ -2051,6 +2068,8 @@ function respond(text, t){
         "• \"squat 225 for 5, three sets\"\n" +
         "• \"bench 185x8, 185x8, 185x7\"\n" +
         "• back-date anything: \"8/3 dumbbell bench press 25 lb for 4 sets of 10\",\n" +
+        "• a whole workout at once — one exercise per line (Shift+Enter for a new line):\n" +
+        "     8/3\n     Dumbbell Bench Press - 25 lb, 4 sets\n     Dumbbell Row - 30 lb, 4 sets\n" +
         "  \"yesterday squat 225 for 5\", \"last monday…\", \"3 days ago…\", \"aug 3…\"\n" +
         "• \"same as last time\" / \"add 5 pounds\"\n" +
         "• \"what's my best deadlift?\" / \"what did I do Monday?\"\n" +
@@ -2197,23 +2216,15 @@ function respond(text, t){
   var wasFuzzy = lastMatchFuzzy;
   return function(){
     if(nums.entries.length && exL){
-      var needReps = nums.entries.some(function(e){ return !e.reps; });
-      if(needReps){
-        var guess = lastRepsFor(exL);
-        if(guess){
-          nums.entries.forEach(function(e){ if(!e.reps) e.reps = guess; });
-          chatSay("You didn't say reps, so I used " + guess + " — the same as your last " + exL + " set.");
-        } else {
-          return ask("How many reps per set on that " + exL + "?", "reps", ["8","10","12"],
-            function(x){
-              var mm = String(x).match(/\d+/);
-              if(!mm) return chatSay("I still need a rep count — say a number like \"8\".");
-              nums.entries.forEach(function(e){ if(!e.reps) e.reps = parseInt(mm[0],10); });
-              commitSets(exL, nums.entries, nums.unit, nums.rpe, body, logDate);
-            });
-        }
+      var guessed = null;
+      if(nums.entries.some(function(e){ return !e.reps; })){
+        guessed = inferReps(exL);
+        nums.entries.forEach(function(e){ if(!e.reps) e.reps = guessed.reps; });
       }
       commitSets(exL, nums.entries, nums.unit, nums.rpe, body, logDate);
+      if(guessed)
+        chatSay("You didn't say reps, so I used " + guessed.reps + " — based on " + guessed.why +
+                ". Say \"make it 10 reps\" to change them.");
       if(wasFuzzy === exL)
         chatSay("I didn't have an exact match for what you typed, so I used the closest one: " + exL +
                 ". Say \"undo\" if that's the wrong lift.");
@@ -2236,34 +2247,62 @@ function respond(text, t){
   };
 }
 
+/* Work out a sensible rep count when the user gives weight and sets but no reps:
+   their own history first, then their goal's scheme, then the standard range for
+   the movement type (heavy compound < compound < isolation < core). */
+function inferReps(exName){
+  var mine = lastRepsFor(exName);
+  if(mine) return { reps: mine, why: "your last " + exName + " set" };
+
+  var lc = String(exName).toLowerCase();
+  if(/plank|crunch|leg raise|ab wheel|hollow|dead bug/.test(lc))
+    return { reps: 15, why: "the usual core range" };
+  if(/curl|lateral|rear delt|fly|flye|crossover|pushdown|kickback|extension|shrug|raise|pec deck|calf/.test(lc))
+    return { reps: 12, why: "the usual isolation range" };
+
+  var isMain = /squat|deadlift|bench press|overhead press|shoulder press|military press|push press|incline press|barbell row|bent-over row|bent over row|pull-up|chin-up|dip/.test(lc);
+  var g = profile().goal;
+  if(g) return { reps: scheme(g, isMain).reps, why: "your " + g + " program" };
+  return isMain ? { reps: 8, why: "the standard compound range" }
+                : { reps: 10, why: "a standard working range" };
+}
+
 /* Reps from the most recent set of this exercise, used when the user omits them. */
 function lastRepsFor(name){
   var pool = state.sets.filter(function(s){ return s.exercise === name; });
   return pool.length ? pool[pool.length-1].reps : null;
 }
 
-function commitSets(exName, entries, unit, rpe, srcText, dateOverride){
-  if(unit && unit !== state.unit){
-    state.unit = unit; $("unitSel").value = unit;
-  }
-  var date = dateOverride || parseDate(srcText || "") || $("sessDate").value || todayISO();
+/* Write one exercise's sets into the log. Shared by single and batch logging. */
+function pushEntries(exName, entries, rpe, date){
   var match = findExercise(exName);
+  var name = match ? match.name : titleCase(exName);
   var ids = [], total = 0, vol = 0, topW = 0, topR = 0;
   entries.forEach(function(en){
     var n = Math.max(1, Math.min(20, en.sets||1));
     for(var i=0;i<n;i++){
       var id = uid();
-      state.sets.push({ id:id, date:date, exercise: match?match.name:titleCase(exName),
-        exId: match?match.id:"", weight:en.weight||0, reps:en.reps,
+      state.sets.push({ id:id, date:date, exercise:name, exId: match?match.id:"",
+        weight:en.weight||0, reps:en.reps,
         rpe: rpe==null?null:rpe, unit:state.unit, note:"" });
       ids.push(id); total++; vol += (en.weight||0)*en.reps;
       if(e1rm(en.weight,en.reps) > e1rm(topW,topR)){ topW = en.weight; topR = en.reps; }
     }
   });
+  return { ids:ids, name:name, total:total, vol:vol, topW:topW, topR:topR };
+}
+
+function commitSets(exName, entries, unit, rpe, srcText, dateOverride){
+  if(unit && unit !== state.unit){
+    state.unit = unit; $("unitSel").value = unit;
+  }
+  var date = dateOverride || parseDate(srcText || "") || todayISO();
+  var res = pushEntries(exName, entries, rpe, date);
+  var ids = res.ids, total = res.total, topW = res.topW, topR = res.topR;
   lastBatch = ids;
   save(); renderAll();
 
-  var name = match ? match.name : titleCase(exName);
+  var name = res.name;
   var detail = entries.map(function(en){
     return (en.sets>1 ? en.sets+"×" : "") + en.reps + " @ " + fmt(en.weight,1) + " " + state.unit;
   }).join(", ");
@@ -2308,6 +2347,141 @@ function commitSets(exName, entries, unit, rpe, srcText, dateOverride){
 
   chatSay(msg, {undo:true});
   setChips(["Same again","Add 5 pounds","What's my best " + name.split(" ").slice(-1)[0].toLowerCase() + "?","Undo"]);
+}
+
+/* ===============================================================
+   BATCH LOGGING — a whole workout in one message
+   "8/3
+    - Dumbbell Bench Press - 25 lb, 4 sets
+    - Single-Arm Dumbbell Row - 30 lb, 4 sets"
+   A date anywhere in the message applies to every line; no date means today.
+   =============================================================== */
+
+/* Split a pasted workout into one line per exercise, tolerating markdown
+   bullets, bold markers, em dashes, numbered lists and stray invisible chars. */
+function splitWorkoutLines(raw){
+  var s = String(raw||"")
+    .replace(/[\u200b\u200c\u200d\ufeff]/g,"")
+    .replace(/\*\*|__|`/g," ")
+    .replace(/[\u2013\u2014]/g," ");
+  var parts = s.split(/\r?\n/);
+  if(parts.length < 2) parts = s.split(/[;\u2022]|(?:^|\s)[-*]\s+/);
+  if(parts.length < 2){
+    /* A single-line input strips the newlines out of a pasted list, so break
+       after each "4 sets" / "10 reps" whenever a new exercise name follows. */
+    parts = s.replace(/(\b\d+\s*(?:sets?|reps?)\b)(?!\s*(?:of|at|x|with|each|per|and|then|@|\d))\s+/gi, "$1\n")
+             .split(/\r?\n/);
+  }
+  return parts.map(function(p){
+    return String(p||"").replace(/^\s*(?:[-*\u2022>]|\d+[.)])\s*/,"").replace(/\s+/g," ").trim();
+  }).filter(function(p){ return p.length > 2; });
+}
+
+/* Read a multi-line message into a list of {exercise, entries, date} items.
+   Returns null when it isn't really a multi-exercise workout. */
+function parseWorkoutBatch(raw){
+  var lines = splitWorkoutLines(raw);
+  if(lines.length < 2) return null;
+  var globalHit = findDatePhrase(raw);
+  var items = [], skipped = [], unit = null, seen = {};
+  lines.forEach(function(line){
+    var hit = findDatePhrase(line);
+    var body = hit ? stripDate(line) : line;
+    var nums = parseNumbers(body);
+    var ex = matchExercise(body);
+    var fuzzy = (ex && lastMatchFuzzy === ex) ? ex : null;
+    if(!nums.entries.length && !ex) return;            /* headers like "Push Day" */
+    if(ex && nums.entries.length){
+      if(nums.unit) unit = nums.unit;
+      items.push({ exercise:ex, entries:nums.entries, rpe:nums.rpe, fuzzy:fuzzy, src:line,
+                   date: hit ? hit.date : (globalHit ? globalHit.date : todayISO()) });
+      seen[ex] = 1;
+    } else {
+      skipped.push(line);
+    }
+  });
+  if(items.length < 2) return null;
+  return { items:items, skipped:skipped, unit:unit };
+}
+
+function commitBatch(batch){
+  if(batch.unit && batch.unit !== state.unit){
+    state.unit = batch.unit; $("unitSel").value = batch.unit;
+  }
+
+  /* No reps in the list? Fill them in intelligently rather than interrogating. */
+  var assumed = [];
+  batch.items.forEach(function(it){
+    it.entries.forEach(function(en){
+      if(en.reps) return;
+      var g = inferReps(it.exercise);
+      en.reps = g.reps;
+      if(!it.assumed){ it.assumed = g; assumed.push({ ex:it.exercise, reps:g.reps, why:g.why }); }
+    });
+  });
+
+  var ids = [], rows = [], prs = [], fuzzies = [], dates = {}, totalSets = 0, totalVol = 0;
+  batch.items.forEach(function(it){
+    var priorBest = bestFor(it.exercise);
+    var res = pushEntries(it.exercise, it.entries, it.rpe, it.date);
+    ids = ids.concat(res.ids);
+    totalSets += res.total; totalVol += res.vol;
+    dates[it.date] = 1;
+    rows.push([res.name, res.total, it.entries.map(function(en){
+      return (en.sets > 1 ? en.sets + "\u00d7" : "") + en.reps + " @ " + fmt(en.weight,1);
+    }).join(", ")]);
+    if(priorBest && e1rm(res.topW,res.topR) > e1rm(priorBest.weight, priorBest.reps))
+      prs.push(res.name + " (beats " + fmt(priorBest.weight,1) + " " + state.unit + " \u00d7 " + priorBest.reps + ")");
+    if(it.fuzzy) fuzzies.push(it.src + " \u2192 " + res.name);
+  });
+  lastBatch = ids;
+  save(); renderAll();
+
+  var dayList = Object.keys(dates).sort();
+  var when = dayList.length === 1
+    ? (dayList[0] === todayISO() ? "today" : prettyDate(dayList[0]) + " (" + dayList[0] + ")")
+    : dayList.length + " different dates";
+  var msg = "Logged " + batch.items.length + " exercises, " + totalSets + " sets for " + when +
+            " \u2014 " + fmt(totalVol,0) + " " + state.unit + " of volume.";
+  if(assumed.length){
+    /* group by rep count so the note stays short */
+    var byReps = {};
+    assumed.forEach(function(a){ (byReps[a.reps] = byReps[a.reps] || []).push(a.ex); });
+    var groups = Object.keys(byReps).sort(function(a,b){ return a-b; }).map(function(r){
+      return r + " reps on " + byReps[r].join(", ");
+    });
+    msg += "\n\nNo reps in your list, so I filled them in from your history and the standard range " +
+           "for each movement: " + groups.join("; ") + ".\n" +
+           "Say \"make it 10 reps\" to reset every set I just logged.";
+  }
+  if(prs.length) msg += "\n\nPersonal bests: " + prs.join("; ") + ".";
+  if(fuzzies.length) msg += "\n\nClosest match used for: " + fuzzies.join("; ") + ".";
+  if(batch.skipped.length) msg += "\n\nI couldn't read: " + batch.skipped.join(" | ") + ".";
+
+  if(dayList.length === 1){
+    $("sessDate").value = dayList[0];
+    renderToday();
+    if(dayList[0] !== todayISO())
+      msg += "\nThe Log tab is now showing " + prettyDate(dayList[0]) + ".";
+  }
+
+  chatSay(msg, {undo:true, table:{headers:["Exercise","Sets","Detail"], rows:rows}});
+  setChips(["How was my week?","Am I balanced?","Undo"]);
+}
+
+/* Rewrite the rep count on the sets from the most recent log, for when the
+   coach guessed and the user wants a different number. */
+function retagReps(n){
+  if(!(n > 0 && n <= 100)) return chatSay("That rep count doesn't look right — try a number between 1 and 100.");
+  var touched = 0, names = {};
+  state.sets.forEach(function(s){
+    if(lastBatch.indexOf(s.id) >= 0){ s.reps = n; touched++; names[s.exercise] = 1; }
+  });
+  if(!touched) return chatSay("I don't have a recent entry to correct — log something first.");
+  save(); renderAll();
+  chatSay("Updated — " + touched + " set" + (touched===1?"":"s") + " across " +
+          Object.keys(names).length + " exercise" + (Object.keys(names).length===1?"":"s") +
+          " now at " + n + " reps each.");
 }
 
 /* Alternatives grouped by what a movement actually trains. */
@@ -2401,9 +2575,12 @@ function init(){
   });
   $("chatForm").addEventListener("submit", function(e){ e.preventDefault(); doSend(); });
   $("chatSend").addEventListener("click", function(e){ e.preventDefault(); doSend(); });
+  /* Enter sends; Shift+Enter adds a line so a whole workout can be pasted or typed. */
   $("chatIn").addEventListener("keydown", function(e){
-    if(e.key === "Enter" || e.keyCode === 13){ e.preventDefault(); doSend(); }
+    if((e.key === "Enter" || e.keyCode === 13) && !e.shiftKey){ e.preventDefault(); doSend(); }
   });
+  $("chatIn").addEventListener("input", growChatBox);
+  $("chatIn").addEventListener("paste", function(){ setTimeout(growChatBox, 0); });
   /* Phone keyboards shrink the viewport — keep the input and Send button in view. */
   $("chatIn").addEventListener("focus", function(){
     setTimeout(function(){
