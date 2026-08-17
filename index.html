@@ -151,7 +151,7 @@ dialog .dlg-head h2{margin:0;font-size:16px;flex:1}
       <div class="chatlog" id="chatLog"></div>
       <div class="chips" id="chatChips"></div>
       <form class="chatbar" id="chatForm">
-        <input type="text" id="chatIn" placeholder="e.g. squat 225 for 5, three sets"
+        <input type="text" id="chatIn" placeholder="e.g. 8/3 dumbbell bench press 25 lb for 4 sets of 10"
                autocomplete="off" autocapitalize="none" autocorrect="off" enterkeyhint="send">
         <button class="btn primary" type="button" id="chatSend">Send</button>
       </form>
@@ -1115,6 +1115,7 @@ function cleanText(s){
     .replace(/[^a-z0-9\s\-]/g," ").replace(/\s+/g," ").trim() + " ");
 }
 function matchExercise(raw){
+  lastMatchFuzzy = null;
   var t = cleanText(raw);
   /* "benched", "squatting", "rowed" → also test the stem */
   t.trim().split(" ").forEach(function(w){
@@ -1129,10 +1130,14 @@ function matchExercise(raw){
   for(var k in ALIASES){
     if(t.indexOf(" "+k+" ") >= 0 && k.length > aliasLen){ aliasHit = ALIASES[k]; aliasLen = k.length; }
   }
-  var pool = chatCandidates(), best = null, bestScore = 0;
+  /* the user's own words, minus filler and numbers — used for typo-tolerant scoring */
+  var qWords = t.trim().split(" ").filter(function(w){
+    return w.length > 2 && NOISE.indexOf(w) < 0 && !/^\d/.test(w);
+  });
+  var pool = chatCandidates(), best = null, bestScore = 0, bestFuzzy = false;
   for(var i=0;i<pool.length;i++){
     var name = pool[i], lc = " " + name.toLowerCase().replace(/[^a-z0-9\s\-]/g," ").replace(/\s+/g," ").trim() + " ";
-    var score = 0;
+    var score = 0, usedFuzzy = false;
     if(t.indexOf(lc) >= 0){
       score = 200 + lc.length;
     } else {
@@ -1141,17 +1146,96 @@ function matchExercise(raw){
       });
       if(!toks.length) continue;
       var hit = 0;
-      toks.forEach(function(w){ if(t.indexOf(w) >= 0) hit++; });
+      toks.forEach(function(w){
+        if(t.indexOf(w) >= 0){ hit++; return; }
+        /* near-miss spelling ("doumble" → "dumbbell") counts as a partial hit */
+        var bestW = 0;
+        qWords.forEach(function(q){ var v = wordSim(q, w); if(v > bestW) bestW = v; });
+        if(bestW >= 0.55){ hit += bestW; usedFuzzy = true; }
+      });
       if(!hit) continue;
       score = (hit/toks.length)*50 + hit*6;
       if(hit === toks.length) score += 25;
       score -= Math.min(10, toks.length - hit);
     }
-    if(score > bestScore){ bestScore = score; best = name; }
+    if(score > bestScore){ bestScore = score; best = name; bestFuzzy = usedFuzzy; }
   }
-  if(aliasHit && bestScore < 200 + aliasLen) return aliasHit;
-  if(bestScore >= 28) return best;
-  return aliasHit;
+  /* A short alias ("bench") gives way to a strong full-name match
+     ("doumble bench press" → Dumbbell Bench Press). */
+  if(aliasHit && bestScore < 45) return aliasHit;
+  if(bestScore >= 28){
+    if(bestFuzzy) lastMatchFuzzy = best;
+    return best;
+  }
+  if(aliasHit) return aliasHit;
+  /* Nothing matched cleanly — fall back to the closest name we know
+     so typos like "doumble bench" still land on Dumbbell Bench Press. */
+  var fz = closestExercise(raw);
+  if(fz){ lastMatchFuzzy = fz.name; return fz.name; }
+  return null;
+}
+var lastMatchFuzzy = null;
+
+/* Dice coefficient on letter bigrams — tolerant of typos and letter swaps. */
+function bigrams(s){
+  var out = [];
+  for(var i=0;i<s.length-1;i++) out.push(s.slice(i,i+2));
+  return out;
+}
+function similar(a, b){
+  a = String(a); b = String(b);
+  if(!a || !b) return 0;
+  if(a === b) return 1;
+  var A = bigrams(a), B = bigrams(b).slice();
+  if(!A.length || !B.length) return 0;
+  var hit = 0;
+  A.forEach(function(g){
+    var i = B.indexOf(g);
+    if(i >= 0){ hit++; B.splice(i,1); }
+  });
+  return 2*hit/(bigrams(a).length + bigrams(b).length);
+}
+
+/* Word-level similarity: bigram overlap plus shared-letter overlap, so both
+   transpositions ("barbel") and inserted letters ("doumble") still score. */
+function wordSim(a, b){
+  a = String(a).toLowerCase(); b = String(b).toLowerCase();
+  if(!a || !b) return 0;
+  if(a === b) return 1;
+  var la = a.split("").sort(), lb = b.split("").sort(), copy = lb.slice(), shared = 0;
+  la.forEach(function(c){ var i = copy.indexOf(c); if(i >= 0){ shared++; copy.splice(i,1); } });
+  var letterDice = 2*shared/(a.length + b.length);
+  var v = 0.5*similar(a,b) + 0.5*letterDice;
+  if(Math.abs(a.length - b.length) > 3) v *= 0.7;
+  return v;
+}
+
+/* Best fuzzy match across everything already logged plus the exercise library. */
+function closestExercise(raw){
+  var words = cleanText(raw).trim().split(" ").filter(function(w){
+    return w.length > 2 && NOISE.indexOf(w) < 0 && !/^\d/.test(w);
+  });
+  if(!words.length) return null;
+  var q = words.join(" ");
+  var pool = chatCandidates(), best = null, bestScore = 0;
+  pool.forEach(function(name){
+    var lc = name.toLowerCase().replace(/[^a-z0-9\s\-]/g," ").replace(/\s+/g," ").trim();
+    var toks = lc.split(/[\s\-]+/).filter(function(w){ return w.length > 2; });
+    if(!toks.length) return;
+    /* average of each library word's best match against the user's words */
+    var sum = 0;
+    toks.forEach(function(tk){
+      var bestW = 0;
+      words.forEach(function(w){ var v = similar(w, tk); if(v > bestW) bestW = v; });
+      sum += bestW;
+    });
+    var tokScore = sum / toks.length;
+    var score = Math.max(tokScore, similar(q, lc));
+    /* prefer names the user has actually logged before */
+    if(score > bestScore){ bestScore = score; best = name; }
+  });
+  if(best && bestScore >= 0.45) return { name: best, score: bestScore };
+  return null;
 }
 
 /* Pull sets/reps/weight out of natural phrasing. */
@@ -1183,6 +1267,15 @@ function parseNumbers(raw){
   if(m){
     var s1 = parseInt(m[1],10), r1 = parseInt(m[2],10), w1 = parseFloat(m[3]);
     if(s1 <= 20 && r1 <= 50) return { entries:[{weight:w1, reps:r1, sets:s1}], unit:unit, rpe:rpe };
+  }
+
+  /* "25 lb for 4 sets" — the number after "for" is sets, so reps may be missing */
+  m = t.match(/\b(\d+(?:\.\d+)?)\s*(?:lbs?|kgs?|pounds?|kilos?)?\s*(?:x|for|times|of)?\s*(\d+)\s*sets?\b/);
+  if(m && /(?:x|for|times|of|lbs?|kgs?|pounds?|kilos?)\s*\d+\s*sets?\b/.test(t)){
+    var wS = parseFloat(m[1]), sS = parseInt(m[2],10);
+    var mrep = t.match(/\bsets?\s*(?:of|x)\s*(\d+)\b/) || t.match(/\b(\d+)\s*reps?\b/);
+    if(sS <= 20)
+      return { entries:[{weight:wS, reps: mrep ? parseInt(mrep[1],10) : null, sets:sS}], unit:unit, rpe:rpe };
   }
 
   /* "225 for 5, 3 sets" / "225 x 5 for 3 sets" */
@@ -1224,22 +1317,112 @@ function parseNumbers(raw){
   return { entries: [], unit: unit, rpe: rpe };
 }
 
-function parseDate(raw){
-  var t = cleanText(raw);
-  var base = new Date($("sessDate").value || todayISO());
-  function iso(d){ var o=d.getTimezoneOffset(); return new Date(d.getTime()-o*60000).toISOString().slice(0,10); }
-  if(/\byesterday\b/.test(t)){ var y = new Date(); y.setDate(y.getDate()-1); return iso(y); }
-  if(/\btoday\b/.test(t)) return todayISO();
-  var days = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+var MONTHS = {jan:1,january:1,feb:2,february:2,mar:3,march:3,apr:4,april:4,may:5,jun:6,june:6,
+  jul:7,july:7,aug:8,august:8,sep:9,sept:9,september:9,oct:10,october:10,nov:11,november:11,dec:12,december:12};
+var DAYNAMES = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+
+function isoOf(d){ var o=d.getTimezoneOffset(); return new Date(d.getTime()-o*60000).toISOString().slice(0,10); }
+function daysAgo(n){ var d = new Date(); d.setDate(d.getDate()-n); return isoOf(d); }
+
+/* Build an ISO date from month/day (+ optional year). With no year, assume the
+   most recent occurrence — a date that would land in the future rolls back a year. */
+function buildDate(month, day, year){
+  if(!(month>=1 && month<=12) || !(day>=1 && day<=31)) return null;
+  var now = new Date();
+  if(year == null){
+    year = now.getFullYear();
+    var cand = new Date(year, month-1, day);
+    if(cand.getTime() - now.getTime() > 36e5*24) year -= 1;
+  } else if(year < 100){
+    year += 2000;
+  }
+  var d = new Date(year, month-1, day);
+  if(d.getMonth() !== month-1) return null;     /* e.g. Feb 31 */
+  return isoOf(d);
+}
+
+/* Every date pattern the coach understands, newest-style first.
+   Returns {date, match} so the caller can strip the phrase before parsing numbers. */
+function findDatePhrase(raw){
+  var s = String(raw||"");
+  var m;
+
+  /* 2026-08-03 */
+  m = s.match(/\b(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})\b/);
+  if(m){
+    var d1 = buildDate(parseInt(m[2],10), parseInt(m[3],10), parseInt(m[1],10));
+    if(d1) return { date:d1, match:m[0] };
+  }
+  /* 8/3, 08/03/2026, 8/3/26 — slash only, so rep ranges like "5-8" stay reps */
+  m = s.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+  if(m){
+    var d2 = buildDate(parseInt(m[1],10), parseInt(m[2],10), m[3]?parseInt(m[3],10):null);
+    if(d2) return { date:d2, match:m[0] };
+  }
+  /* aug 3 / august 3rd / 3 aug / 3rd of august (optional year) */
+  var mn = "(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)";
+  m = s.match(new RegExp("\\b" + mn + "\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s*(\\d{4}))?\\b", "i"));
+  if(m){
+    var d3 = buildDate(MONTHS[m[1].toLowerCase()], parseInt(m[2],10), m[3]?parseInt(m[3],10):null);
+    if(d3) return { date:d3, match:m[0] };
+  }
+  m = s.match(new RegExp("\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?" + mn + "\\.?(?:,?\\s*(\\d{4}))?\\b", "i"));
+  if(m){
+    var d4 = buildDate(MONTHS[m[2].toLowerCase()], parseInt(m[1],10), m[3]?parseInt(m[3],10):null);
+    if(d4) return { date:d4, match:m[0] };
+  }
+
+  var t = cleanText(s);
+  /* the day before yesterday */
+  if(/\bday before yesterday\b/.test(t)) return { date: daysAgo(2), match:"day before yesterday" };
+  if(/\byesterday\b/.test(t)) return { date: daysAgo(1), match:"yesterday" };
+  if(/\btoday\b/.test(t)) return { date: todayISO(), match:"today" };
+
+  /* 3 days ago / two weeks ago / a week ago / last week */
+  var wordNum = {a:1,an:1,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,
+    eleven:11,twelve:12,fourteen:14,twenty:20,thirty:30};
+  m = t.match(/\b(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fourteen|twenty|thirty)\s+(day|days|week|weeks|month|months)\s+ago\b/);
+  if(m){
+    var n = /^\d+$/.test(m[1]) ? parseInt(m[1],10) : (wordNum[m[1]]||1);
+    var mult = /week/.test(m[2]) ? 7 : (/month/.test(m[2]) ? 30 : 1);
+    return { date: daysAgo(n*mult), match: m[0] };
+  }
+  if(/\blast week\b/.test(t)) return { date: daysAgo(7), match:"last week" };
+
+  /* monday / last monday — always the most recent past one */
   for(var i=0;i<7;i++){
-    if(new RegExp("\\blast "+days[i]+"\\b|\\b"+days[i]+"\\b").test(t)){
-      var d = new Date(), diff = (d.getDay() - i + 7) % 7;
-      if(diff === 0) diff = 7;
-      d.setDate(d.getDate() - diff);
-      return iso(d);
+    var re = new RegExp("\\b(?:last\\s+|this\\s+|on\\s+)?" + DAYNAMES[i] + "\\b|\\b" + DAYNAMES[i].slice(0,3) + "\\b", "i");
+    var dm = s.match(re);
+    if(dm){
+      var now2 = new Date(), diff = (now2.getDay() - i + 7) % 7;
+      if(diff === 0) diff = /\btoday\b/.test(t) ? 0 : 7;
+      return { date: daysAgo(diff), match: dm[0] };
     }
   }
   return null;
+}
+
+function parseDate(raw){
+  var hit = findDatePhrase(raw);
+  return hit ? hit.date : null;
+}
+
+/* Remove the date phrase so "8/3" is never mistaken for weight or reps. */
+function stripDate(raw){
+  var hit = findDatePhrase(raw);
+  if(!hit) return String(raw||"");
+  return String(raw||"").replace(hit.match, " ")
+    .replace(/\b(on|for|from|back on|the)\s+$/i," ")
+    .replace(/\s+/g," ").trim();
+}
+
+/* Friendly label for a past date: "Mon Aug 3" */
+function prettyDate(isoStr){
+  var p = String(isoStr).split("-");
+  var d = new Date(parseInt(p[0],10), parseInt(p[1],10)-1, parseInt(p[2],10));
+  var mons = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  return DAYNAMES[d.getDay()].slice(0,3).replace(/^./,function(c){return c.toUpperCase();}) +
+         " " + mons[d.getMonth()] + " " + d.getDate();
 }
 
 function chatSay(text, opts){
@@ -1867,6 +2050,8 @@ function respond(text, t){
         "LOGGING\n" +
         "• \"squat 225 for 5, three sets\"\n" +
         "• \"bench 185x8, 185x8, 185x7\"\n" +
+        "• back-date anything: \"8/3 dumbbell bench press 25 lb for 4 sets of 10\",\n" +
+        "  \"yesterday squat 225 for 5\", \"last monday…\", \"3 days ago…\", \"aug 3…\"\n" +
         "• \"same as last time\" / \"add 5 pounds\"\n" +
         "• \"what's my best deadlift?\" / \"what did I do Monday?\"\n" +
         "• \"undo\"");
@@ -2003,15 +2188,41 @@ function respond(text, t){
     };
   }
 
-  /* --- default: try to log --- */
-  var nums = parseNumbers(text);
-  var exL = matchExercise(text);
+  /* --- default: try to log (any date, past or present) --- */
+  var dateHit = findDatePhrase(text);
+  var body = dateHit ? stripDate(text) : text;
+  var logDate = dateHit ? dateHit.date : null;
+  var nums = parseNumbers(body);
+  var exL = matchExercise(body);
+  var wasFuzzy = lastMatchFuzzy;
   return function(){
-    if(nums.entries.length && exL) return commitSets(exL, nums.entries, nums.unit, nums.rpe, text);
+    if(nums.entries.length && exL){
+      var needReps = nums.entries.some(function(e){ return !e.reps; });
+      if(needReps){
+        var guess = lastRepsFor(exL);
+        if(guess){
+          nums.entries.forEach(function(e){ if(!e.reps) e.reps = guess; });
+          chatSay("You didn't say reps, so I used " + guess + " — the same as your last " + exL + " set.");
+        } else {
+          return ask("How many reps per set on that " + exL + "?", "reps", ["8","10","12"],
+            function(x){
+              var mm = String(x).match(/\d+/);
+              if(!mm) return chatSay("I still need a rep count — say a number like \"8\".");
+              nums.entries.forEach(function(e){ if(!e.reps) e.reps = parseInt(mm[0],10); });
+              commitSets(exL, nums.entries, nums.unit, nums.rpe, body, logDate);
+            });
+        }
+      }
+      commitSets(exL, nums.entries, nums.unit, nums.rpe, body, logDate);
+      if(wasFuzzy === exL)
+        chatSay("I didn't have an exact match for what you typed, so I used the closest one: " + exL +
+                ". Say \"undo\" if that's the wrong lift.");
+      return;
+    }
     if(nums.entries.length && !exL){
       var lastEx = state.sets.length ? state.sets[state.sets.length-1].exercise : null;
       if(lastEx && /\b(and|then|also|another|more)\b/.test(t))
-        return commitSets(lastEx, nums.entries, nums.unit, nums.rpe, text);
+        return commitSets(lastEx, nums.entries, nums.unit, nums.rpe, body, logDate);
       return chatSay("I got the numbers but not the exercise. Which lift was that? " +
         (lastEx ? "(Say \"same\" if it was another " + lastEx + " set.)" : ""));
     }
@@ -2025,11 +2236,17 @@ function respond(text, t){
   };
 }
 
-function commitSets(exName, entries, unit, rpe, srcText){
+/* Reps from the most recent set of this exercise, used when the user omits them. */
+function lastRepsFor(name){
+  var pool = state.sets.filter(function(s){ return s.exercise === name; });
+  return pool.length ? pool[pool.length-1].reps : null;
+}
+
+function commitSets(exName, entries, unit, rpe, srcText, dateOverride){
   if(unit && unit !== state.unit){
     state.unit = unit; $("unitSel").value = unit;
   }
-  var date = parseDate(srcText || "") || $("sessDate").value || todayISO();
+  var date = dateOverride || parseDate(srcText || "") || $("sessDate").value || todayISO();
   var match = findExercise(exName);
   var ids = [], total = 0, vol = 0, topW = 0, topR = 0;
   entries.forEach(function(en){
@@ -2050,8 +2267,9 @@ function commitSets(exName, entries, unit, rpe, srcText){
   var detail = entries.map(function(en){
     return (en.sets>1 ? en.sets+"×" : "") + en.reps + " @ " + fmt(en.weight,1) + " " + state.unit;
   }).join(", ");
+  var backdated = date !== todayISO();
   var msg = "Logged " + total + " set" + (total===1?"":"s") + " of " + name + " — " + detail +
-            (date !== todayISO() ? " on " + date : "") + ".";
+            (backdated ? " on " + prettyDate(date) + " (" + date + ")" : "") + ".";
 
   /* PR + comparison coaching */
   var prior = state.sets.filter(function(s){
@@ -2063,8 +2281,12 @@ function commitSets(exName, entries, unit, rpe, srcText){
       msg += "\n\nThat's a personal best — beats " + fmt(prevBest.weight,1) + " " + state.unit +
              " × " + prevBest.reps + " from " + prevBest.date + ".";
     } else {
-      var lastDate = prior[prior.length-1].date;
-      if(lastDate !== date){
+      /* compare against the most recent session *before* the date being logged */
+      var earlier = prior.filter(function(s){ return s.date < date; }).sort(function(a,b){
+        return a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
+      });
+      var lastDate = earlier.length ? earlier[earlier.length-1].date : null;
+      if(lastDate && lastDate !== date){
         var thatDay = prior.filter(function(s){ return s.date === lastDate; });
         var topThen = thatDay.reduce(function(a,b){ return e1rm(b.weight,b.reps) > e1rm(a.weight,a.reps) ? b : a; });
         msg += "\n\nLast " + name + " session (" + lastDate + "): " + thatDay.length + " sets, best " +
@@ -2076,7 +2298,13 @@ function commitSets(exName, entries, unit, rpe, srcText){
   }
   var dayVol = state.sets.filter(function(s){ return s.date===date; })
                          .reduce(function(a,s){ return a + s.weight*s.reps; },0);
-  msg += "\nSession total: " + fmt(dayVol,0) + " " + state.unit + " of volume.";
+  msg += "\nSession total for " + (backdated ? prettyDate(date) : "today") + ": " +
+         fmt(dayVol,0) + " " + state.unit + " of volume.";
+  if(backdated){
+    $("sessDate").value = date;
+    renderToday();
+    msg += "\nThe Log tab is now showing " + prettyDate(date) + " — switch the date back whenever you like.";
+  }
 
   chatSay(msg, {undo:true});
   setChips(["Same again","Add 5 pounds","What's my best " + name.split(" ").slice(-1)[0].toLowerCase() + "?","Undo"]);
