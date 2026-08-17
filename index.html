@@ -222,6 +222,7 @@ dialog .dlg-head h2{margin:0;font-size:16px;flex:1}
         <div><label for="fEquip">Equipment</label><select id="fEquip"><option value="">All</option></select></div>
       </div>
       <p class="small muted" id="libStatus" style="margin-block-end:0"></p>
+      <p style="margin-block-end:0"><button class="btn mini" id="btnRetryLib" hidden>Retry loading demos</button></p>
     </div>
     <div class="grid" id="exGrid"></div>
     <p class="src" id="libSource"></p>
@@ -298,10 +299,14 @@ dialog .dlg-head h2{margin:0;font-size:16px;flex:1}
    Storage
    --------------------------------------------------------------- */
 var KEY = "strength-tracker-v1";
+/* The demo library is cached under its own key. It can run to a few megabytes,
+   and sharing a key with the workout log risks a quota error taking the log
+   down with it. */
+var LIB_KEY = "strength-tracker-v1:library";
 var state = load();
 
 function blank(){
-  return { unit:"lb", sets:[], routines:[], cachedLib:null, cachedAt:0,
+  return { unit:"lb", sets:[], routines:[],
            profile:null, onboard:null, checkins:[], plan:null, llm:null, chat:[] };
 }
 function load(){
@@ -360,6 +365,15 @@ function toast(msg){
   toastTimer = setTimeout(function(){ t.remove(); }, 2600);
 }
 /* Epley 1RM, capped at 12 reps where the formula stays sane */
+/* Sets remember the unit they were logged in. Every calculation reads weights
+   through here so a lb→kg switch can never silently mix the two. */
+var LB_PER_KG = 2.20462;
+function wt(s){
+  var w = (s && s.weight) || 0;
+  if(!s || !s.unit || s.unit === state.unit) return w;
+  return s.unit === "kg" ? w * LB_PER_KG : w / LB_PER_KG;
+}
+
 function e1rm(w, r){
   if(!w || !r) return 0;
   if(r === 1) return w;
@@ -410,25 +424,191 @@ var FALLBACK = [
 var library = [];
 var libFromApi = false;
 
+/* ---------------------------------------------------------------
+   Offline muscle maps
+   The demo animations come from a third-party host that some
+   networks block outright. Rather than showing "No demo", every
+   exercise gets a diagram drawn in the browser from its target
+   muscle — no network, no third party, always available.
+   --------------------------------------------------------------- */
+var BODY_BASE = "#c9cfd8", BODY_LINE = "#8b94a3";
+
+/* Each region is a set of SVG shapes. Front figure on the left,
+   back figure on the right, inside one 210×170 viewBox. */
+function bodyRegions(){
+  return {
+    delts:      ['<ellipse cx="31" cy="36" rx="7.5" ry="7"/>','<ellipse cx="65" cy="36" rx="7.5" ry="7"/>'],
+    pectorals:  ['<rect x="35" y="32" width="11" height="13" rx="4"/>','<rect x="50" y="32" width="11" height="13" rx="4"/>'],
+    abs:        ['<rect x="40" y="47" width="16" height="24" rx="5"/>'],
+    biceps:     ['<ellipse cx="26" cy="51" rx="5" ry="9"/>','<ellipse cx="70" cy="51" rx="5" ry="9"/>'],
+    forearms:   ['<ellipse cx="23" cy="69" rx="4.5" ry="10"/>','<ellipse cx="73" cy="69" rx="4.5" ry="10"/>'],
+    quadriceps: ['<ellipse cx="41" cy="95" rx="8" ry="18"/>','<ellipse cx="55" cy="95" rx="8" ry="18"/>'],
+    adductors:  ['<ellipse cx="48" cy="92" rx="4" ry="14"/>'],
+
+    traps:      ['<path d="M141 30 L153 24 L165 30 L159 40 L147 40 Z"/>'],
+    "upper back":['<rect x="140" y="40" width="26" height="16" rx="5"/>'],
+    lats:       ['<path d="M139 44 L146 44 L149 72 L140 64 Z"/>','<path d="M167 44 L160 44 L157 72 L166 64 Z"/>'],
+    spine:      ['<rect x="151" y="30" width="4" height="44" rx="2"/>'],
+    triceps:    ['<ellipse cx="131" cy="51" rx="5" ry="9"/>','<ellipse cx="175" cy="51" rx="5" ry="9"/>'],
+    glutes:     ['<ellipse cx="147" cy="80" rx="8" ry="8"/>','<ellipse cx="159" cy="80" rx="8" ry="8"/>'],
+    hamstrings: ['<ellipse cx="146" cy="100" rx="8" ry="16"/>','<ellipse cx="160" cy="100" rx="8" ry="16"/>'],
+    calves:     ['<ellipse cx="145" cy="128" rx="6" ry="13"/>','<ellipse cx="161" cy="128" rx="6" ry="13"/>']
+  };
+}
+
+/* Plain silhouettes both regions sit on top of. */
+function bodyOutline(cx){
+  return '<g fill="' + BODY_BASE + '">' +
+    '<circle cx="'+cx+'" cy="15" r="9"/>' +
+    '<rect x="'+(cx-4)+'" y="23" width="8" height="7"/>' +
+    '<path d="M'+(cx-18)+' 33 Q'+cx+' 27 '+(cx+18)+' 33 L'+(cx+13)+' 74 L'+(cx-13)+' 74 Z"/>' +
+    '<rect x="'+(cx-22)+'" y="40" width="8" height="34" rx="4"/>' +
+    '<rect x="'+(cx+14)+'" y="40" width="8" height="34" rx="4"/>' +
+    '<rect x="'+(cx-11)+'" y="74" width="9" height="70" rx="4.5"/>' +
+    '<rect x="'+(cx+2)+'" y="74" width="9" height="70" rx="4.5"/>' +
+    '</g>';
+}
+
+/* Which drawn regions light up for a given target muscle name. */
+function regionsFor(target){
+  var t = String(target||"").toLowerCase();
+  var map = {
+    "delts":["delts"], "shoulders":["delts"], "deltoids":["delts"],
+    "pectorals":["pectorals"], "chest":["pectorals"], "pecs":["pectorals"],
+    "abs":["abs"], "abdominals":["abs"], "core":["abs"], "obliques":["abs"],
+    "biceps":["biceps"], "forearms":["forearms"],
+    "quadriceps":["quadriceps"], "quads":["quadriceps"],
+    "adductors":["adductors"], "abductors":["glutes"],
+    "traps":["traps"], "trapezius":["traps"],
+    "upper back":["upper back"], "back":["upper back","lats"], "rhomboids":["upper back"],
+    "lats":["lats"], "latissimus dorsi":["lats"],
+    "spine":["spine"], "lower back":["spine"], "erector spinae":["spine"],
+    "triceps":["triceps"],
+    "glutes":["glutes"], "gluteus maximus":["glutes"],
+    "hamstrings":["hamstrings"], "hams":["hamstrings"],
+    "calves":["calves"], "cardiovascular system":[]
+  };
+  if(map[t]) return map[t];
+  for(var k in map){ if(t.indexOf(k) >= 0) return map[k]; }
+  return [];
+}
+
+/* Build the diagram as a data URI so it drops straight into an <img>. */
+function muscleSVG(target, accent){
+  accent = accent || "#e8590c";
+  var regions = bodyRegions(), hot = regionsFor(target), hotSet = {};
+  hot.forEach(function(k){ hotSet[k] = 1; });
+
+  var body = bodyOutline(48) + bodyOutline(153);
+  var cold = "", warm = "";
+  for(var k in regions){
+    var shapes = regions[k].join("");
+    if(hotSet[k]) warm += shapes; else cold += shapes;
+  }
+  var svg =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 170" width="210" height="170">' +
+      '<rect width="210" height="170" fill="#f6f7f9"/>' + body +
+      '<g fill="' + BODY_LINE + '" opacity="0.55">' + cold + '</g>' +
+      '<g fill="' + accent + '">' + warm + '</g>' +
+      '<text x="48" y="163" font-family="system-ui,sans-serif" font-size="9" fill="#6b7280" text-anchor="middle">front</text>' +
+      '<text x="153" y="163" font-family="system-ui,sans-serif" font-size="9" fill="#6b7280" text-anchor="middle">back</text>' +
+    '</svg>';
+  return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+}
+
+/* Movement cues that ship with the app, so the detail view is useful even
+   when the third-party instruction text can't be fetched. Keyed by movement
+   pattern rather than exercise name — deliberately general, and labelled as
+   such on screen. */
+var PATTERN_CUES = {
+  squat: ["Set the bar or weight over your midfoot and brace your core before you move.",
+          "Sit down and back, knees tracking over your toes.",
+          "Descend until your hip crease passes your knee, or as deep as you control.",
+          "Drive up through the whole foot, hips and chest rising together."],
+  hinge: ["Push your hips back with a long, flat spine — this is a hinge, not a squat.",
+          "Keep the weight close to your legs the whole way.",
+          "Feel the stretch in your hamstrings, then drive your hips forward to stand.",
+          "Finish tall and squeeze your glutes; don't lean back."],
+  push:  ["Set your shoulder blades back and down before the first rep.",
+          "Lower under control, elbows around 45° from your torso.",
+          "Touch or reach your target range, then press without letting the elbows flare.",
+          "Keep your wrists stacked over your elbows throughout."],
+  pull:  ["Start from a full stretch and let the shoulder blade move first.",
+          "Pull with your elbow, not your hand — think of driving the elbow back or down.",
+          "Squeeze at the top for a beat without shrugging.",
+          "Lower all the way under control; don't drop out of the rep."],
+  lunge: ["Step out far enough that the front shin stays near vertical.",
+          "Drop the back knee straight down, torso tall.",
+          "Push through the front heel to return.",
+          "Finish all reps on one side, or alternate — just keep it consistent."],
+  raise: ["Use a weight you can move without swinging — momentum steals the work.",
+          "Lead with the elbow or the target joint, pausing briefly at the top.",
+          "Lower slowly; the eccentric is where most of the growth happens.",
+          "Keep your torso still — if you're rocking, drop the weight."],
+  curl:  ["Keep your elbows pinned to your sides.",
+          "Curl without swinging the torso; the upper arm stays put.",
+          "Squeeze at the top, then lower under control to a full stretch.",
+          "Don't let the wrists bend back under the load."],
+  core:  ["Brace as though you're about to be poked in the stomach.",
+          "Keep your ribs down and your pelvis tucked — no arching.",
+          "Move slowly; speed makes this easier, not harder.",
+          "Breathe throughout rather than holding your breath."],
+  calf:  ["Rise as high onto the toes as your ankles allow.",
+          "Pause at the top for a beat.",
+          "Lower to a full stretch below the step if you have one.",
+          "Slow tempo beats heavy weight here."],
+  carry: ["Stand tall, shoulders back, ribs down.",
+          "Grip hard and walk with controlled, deliberate steps.",
+          "Don't lean away from the load.",
+          "Stop the set when your posture breaks, not when your grip fails."]
+};
+
+function patternOf(name){
+  var lc = String(name||"").toLowerCase();
+  if(/carry|farmer/.test(lc)) return "carry";
+  if(/calf|calves/.test(lc)) return "calf";
+  if(/plank|crunch|leg raise|ab wheel|hollow|dead bug|rollout/.test(lc)) return "core";
+  if(/curl/.test(lc)) return "curl";
+  if(/raise|fly|flye|lateral|rear delt|crossover|pushdown|kickback|extension|shrug|pec deck/.test(lc)) return "raise";
+  if(/lunge|split squat|step-up|step up/.test(lc)) return "lunge";
+  if(/squat|leg press/.test(lc)) return "squat";
+  if(/deadlift|romanian|good morning|hip thrust|glute bridge|back extension|swing/.test(lc)) return "hinge";
+  if(/row|pull|chin|pulldown/.test(lc)) return "pull";
+  if(/press|bench|dip|push-up|push up/.test(lc)) return "push";
+  return null;
+}
+function cuesFor(name){
+  var k = patternOf(name);
+  return k ? PATTERN_CUES[k] : null;
+}
+
 function fallbackLib(){
   return FALLBACK.map(function(r,i){
     return { id:"fb"+i, name:r[0], target:r[1], equipment:r[2], bodyPart:"", gif:"", instructions:[] };
   });
 }
-function normalize(rec, i){
+function normalize(rec, i, mediaBase){
   if(!rec || typeof rec!=="object") return null;
   var name = rec.name || rec.exerciseName || rec.title;
   if(!name) return null;
   var instr = rec.instructions || rec.steps || [];
   if(typeof instr === "string") instr = [instr];
   var target = rec.target || rec.targetMuscle ||
-    (Array.isArray(rec.targetMuscles) ? rec.targetMuscles[0] : "") || "";
+    (Array.isArray(rec.targetMuscles) ? rec.targetMuscles[0] : "") ||
+    (Array.isArray(rec.primaryMuscles) ? rec.primaryMuscles[0] : "") || "";
   var equip = rec.equipment || rec.equipmentType ||
     (Array.isArray(rec.equipments) ? rec.equipments[0] : "") || "";
   var eid = rec.exerciseId || rec.id || ("api"+i);
   var gif = rec.gifUrl || rec.imageUrl || rec.image || "";
+  var alt = "";
+  /* static dataset: images are relative paths like "Barbell_Curl/0.jpg" */
+  if(!gif && Array.isArray(rec.images) && rec.images.length && mediaBase){
+    gif = mediaBase + rec.images[0];
+    if(rec.images[1]) alt = mediaBase + rec.images[1];
+  }
   if(!gif && rec.exerciseId) gif = "https://static.exercisedb.dev/media/" + rec.exerciseId + ".gif";
   return {
+    gifAlt: alt,
     id: eid,
     name: titleCase(name),
     target: String(target||"").toLowerCase(),
@@ -448,32 +628,70 @@ var API_HOSTS = [
   "https://exercisedb-api.vercel.app/api/v1/exercises"
 ];
 
+/* Static mirrors of the open free-exercise-db dataset: plain JSON files on a CDN,
+   no API and no key, which keeps working when the API hosts are down or blocked. */
+var STATIC_SOURCES = [
+  { json: "https://cdn.jsdelivr.net/gh/yuhonas/free-exercise-db@main/dist/exercises.json",
+    media: "https://cdn.jsdelivr.net/gh/yuhonas/free-exercise-db@main/exercises/" },
+  { json: "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/dist/exercises.json",
+    media: "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/" }
+];
+
+/* fetch with a hard timeout — without one, a request that never answers leaves
+   the tab stuck on "Loading…" forever. */
+function fetchJSON(url, ms){
+  var ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  var timer = setTimeout(function(){ if(ctrl) ctrl.abort(); }, ms || 12000);
+  var opts = { mode:"cors", headers:{"accept":"application/json"} };
+  if(ctrl) opts.signal = ctrl.signal;
+  return fetch(url, opts).then(function(r){
+    if(!r.ok) throw new Error("http " + r.status);
+    return r.json();
+  }).then(function(j){ clearTimeout(timer); return j; },
+           function(e){ clearTimeout(timer); throw e; });
+}
+
+function readLibCache(){
+  try{
+    var raw = localStorage.getItem(LIB_KEY);
+    if(!raw) return null;
+    var c = JSON.parse(raw);
+    if(!c || !Array.isArray(c.items) || c.items.length < 40) return null;
+    if(Date.now() - (c.at||0) > 30*24*3600*1000) return null;
+    return c.items;
+  }catch(e){ return null; }
+}
+function writeLibCache(items){
+  try{ localStorage.setItem(LIB_KEY, JSON.stringify({at:Date.now(), items:items})); }
+  catch(e){ /* over quota: demos still work this session, just not cached */ }
+}
+
 function fetchLibrary(){
   var status = $("libStatus");
-  var cacheGood = state.cachedLib && state.cachedLib.length > 40 &&
-                  (Date.now() - (state.cachedAt||0) < 30*24*3600*1000);
-  if(cacheGood){
-    library = state.cachedLib; libFromApi = true;
+  var retry = $("btnRetryLib");
+  if(retry) retry.hidden = true;
+
+  var cached = readLibCache();
+  if(cached){
+    library = cached; libFromApi = true;
     status.textContent = "Loaded " + library.length + " exercises with demos (saved on this device).";
     afterLibrary();
     return;
   }
+
   library = fallbackLib();
   afterLibrary();
   status.textContent = "Loading the full exercise library with demo animations…";
 
-  var hostIdx = 0;
+  var hostIdx = 0, staticIdx = 0;
 
   function tryHost(){
-    if(hostIdx >= API_HOSTS.length) return give_up();
+    if(hostIdx >= API_HOSTS.length) return tryStatic();
     var base = API_HOSTS[hostIdx], all = [], offset = 0, MAXPAGES = 20, pages = 0;
 
     function step(){
       var url = base + "?limit=100&offset=" + offset;
-      fetch(url, {mode:"cors", headers:{"accept":"application/json"}}).then(function(r){
-        if(!r.ok) throw new Error("http " + r.status);
-        return r.json();
-      }).then(function(j){
+      fetchJSON(url, 12000).then(function(j){
         var rows = pickRows(j);
         if(!rows.length) return done();
         rows.forEach(function(rec,i){ var n = normalize(rec, all.length+i); if(n) all.push(n); });
@@ -488,6 +706,19 @@ function fetchLibrary(){
       hostIdx++; tryHost();
     }
     step();
+  }
+
+  /* Second line of defence: one static JSON file, images served from the same CDN. */
+  function tryStatic(){
+    if(staticIdx >= STATIC_SOURCES.length) return give_up();
+    var src = STATIC_SOURCES[staticIdx];
+    status.textContent = "The exercise API didn't answer — trying the backup demo library…";
+    fetchJSON(src.json, 15000).then(function(j){
+      var rows = pickRows(j), all = [];
+      rows.forEach(function(rec,i){ var n = normalize(rec, i, src.media); if(n) all.push(n); });
+      if(all.length > 40) return succeed(all);
+      staticIdx++; tryStatic();
+    }).catch(function(){ staticIdx++; tryStatic(); });
   }
 
   /* The API has shipped a few envelope shapes; accept all of them. */
@@ -505,15 +736,17 @@ function fetchLibrary(){
   }
   function succeed(all){
     library = all; libFromApi = true;
-    state.cachedLib = all; state.cachedAt = Date.now();
-    save();
+    writeLibCache(all);
     status.textContent = "Loaded " + all.length + " exercises with demo animations.";
+    if(retry) retry.hidden = true;
     afterLibrary();
   }
   function give_up(){
     library = fallbackLib(); libFromApi = false;
-    status.textContent = "Couldn't reach the online exercise library right now — using the built-in list of " +
-      library.length + " core lifts (no demo animations). Everything else works normally; reopen later to retry.";
+    status.textContent = "Demo animations are blocked on this network — showing the built-in list of " +
+      library.length + " core lifts with offline muscle maps and form cues instead. " +
+      "Logging, progress and coaching all work normally.";
+    if(retry) retry.hidden = false;
     afterLibrary();
   }
   tryHost();
@@ -581,12 +814,18 @@ function renderGrid(){
     var card = el("button","ex");
     card.type = "button";
     var th = el("div","thumb");
-    if(e.gif){
-      var img = document.createElement("img");
-      img.loading = "lazy"; img.alt = e.name + " demonstration"; img.src = e.gif;
-      img.addEventListener("error", function(){ th.textContent = "Demo unavailable"; });
-      th.appendChild(img);
-    } else { th.textContent = "No demo"; }
+    var img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = e.gif ? e.name + " demonstration" : e.name + " — muscles worked";
+    img.src = e.gif || muscleSVG(e.target);
+    var stage = 0;
+    img.addEventListener("error", function(){
+      /* remote demo → second frame → offline muscle map, in that order */
+      if(stage === 0 && e.gifAlt){ stage = 1; img.src = e.gifAlt; return; }
+      if(stage < 2){ stage = 2; img.alt = e.name + " — muscles worked"; img.src = muscleSVG(e.target); return; }
+      th.textContent = "No demo";
+    });
+    th.appendChild(img);
     card.appendChild(th);
     var meta = el("div","meta");
     meta.appendChild(el("div","nm", e.name));
@@ -606,23 +845,33 @@ function openExercise(e){
   $("dlgName").textContent = e.name;
   var b = $("dlgBody");
   b.textContent = "";
-  if(e.gif){
-    var img = document.createElement("img");
-    img.src = e.gif; img.alt = e.name + " demonstration";
-    img.style.width="100%"; img.style.borderRadius="10px"; img.style.background="#fff";
-    b.appendChild(img);
-  }
+  var img = document.createElement("img");
+  img.src = e.gif || muscleSVG(e.target);
+  img.alt = e.gif ? e.name + " demonstration" : e.name + " — muscles worked";
+  img.style.width="100%"; img.style.borderRadius="10px"; img.style.background="#fff";
+  var stage = 0;
+  img.addEventListener("error", function(){
+    if(stage === 0 && e.gifAlt){ stage = 1; img.src = e.gifAlt; return; }
+    if(stage < 2){ stage = 2; img.src = muscleSVG(e.target); return; }
+    img.remove();
+  });
+  b.appendChild(img);
+  if(!e.gif)
+    b.appendChild(el("p","small muted","Muscle map — the demo animation host isn't reachable, so this shows what the lift works."));
   var pills = el("p","");
   if(e.target) pills.appendChild(el("span","pill", titleCase(e.target)));
   if(e.equipment) pills.appendChild(el("span","pill", titleCase(e.equipment)));
   if(e.bodyPart) pills.appendChild(el("span","pill", titleCase(e.bodyPart)));
   b.appendChild(pills);
-  if(e.instructions && e.instructions.length){
-    b.appendChild(el("h3",null,"How to perform"));
+  var steps = (e.instructions && e.instructions.length) ? e.instructions : cuesFor(e.name);
+  if(steps && steps.length){
+    b.appendChild(el("h3",null, (e.instructions && e.instructions.length) ? "How to perform" : "Form cues"));
     var ol = document.createElement("ol");
     ol.style.paddingInlineStart = "20px"; ol.style.fontSize = "14px";
-    e.instructions.forEach(function(s){ ol.appendChild(el("li",null,String(s).replace(/^Step:\d+\s*/,""))); });
+    steps.forEach(function(s){ ol.appendChild(el("li",null,String(s).replace(/^Step:\d+\s*/,""))); });
     b.appendChild(ol);
+    if(!(e.instructions && e.instructions.length))
+      b.appendChild(el("p","small muted","General cues for this movement pattern, not step-by-step for this exact variation."));
   }
   var best = bestFor(e.name);
   if(best){
@@ -690,9 +939,9 @@ function updateLastHint(){
     return s.exercise.toLowerCase()===name && s.date !== $("sessDate").value;
   });
   if(!prior.length){ h.textContent = "First time logging this one."; return; }
-  var lastDate = prior[prior.length-1].date;
+  var lastDate = prior.map(function(s){ return s.date; }).sort()[prior.length-1];
   var thatDay = prior.filter(function(s){ return s.date===lastDate; });
-  var top = thatDay.reduce(function(a,b){ return e1rm(b.weight,b.reps) > e1rm(a.weight,a.reps) ? b : a; });
+  var top = thatDay.reduce(function(a,b){ return e1rm(wt(b),b.reps) > e1rm(wt(a),a.reps) ? b : a; });
   h.textContent = "Last time (" + lastDate + "): " + thatDay.length + " sets, best " +
     fmt(top.weight,1) + " " + top.unit + " × " + top.reps + ".";
 }
@@ -703,7 +952,7 @@ function renderToday(){
   box.textContent = "";
   var vol = 0, byEx = {};
   rows.forEach(function(s){
-    vol += s.weight * s.reps;
+    vol += wt(s) * s.reps;
     (byEx[s.exercise] = byEx[s.exercise] || []).push(s);
   });
   $("kSets").textContent = rows.length;
@@ -724,7 +973,7 @@ function renderToday(){
       if(s.rpe) txt += "  @ RPE " + s.rpe;
       if(s.note) txt += "  · " + s.note;
       line.appendChild(el("span","val", txt));
-      line.appendChild(el("span","small muted", fmt(e1rm(s.weight,s.reps),0) + " e1RM"));
+      line.appendChild(el("span","small muted", fmt(e1rm(s.weight,s.reps),0) + " e1RM " + s.unit));
       var del = el("button","btn mini danger","Delete");
       del.addEventListener("click", function(){
         state.sets = state.sets.filter(function(x){ return x.id !== s.id; });
@@ -745,10 +994,23 @@ function exerciseNames(){
   state.sets.forEach(function(s){ if(!seen[s.exercise]){ seen[s.exercise]=1; out.push(s.exercise); } });
   return out.sort();
 }
+/* Best set by estimated 1RM, converted into the unit currently on screen. */
 function bestFor(name){
   var rows = state.sets.filter(function(s){ return s.exercise === name; });
   if(!rows.length) return null;
-  return rows.reduce(function(a,b){ return e1rm(b.weight,b.reps) > e1rm(a.weight,a.reps) ? b : a; });
+  var top = rows.reduce(function(a,b){ return e1rm(wt(b),b.reps) > e1rm(wt(a),a.reps) ? b : a; });
+  return { id:top.id, date:top.date, exercise:top.exercise, reps:top.reps,
+           weight: wt(top), unit: state.unit, rpe: top.rpe };
+}
+
+/* Heaviest single weight ever moved on this lift (not the best 1RM estimate). */
+function heaviestFor(name){
+  var rows = state.sets.filter(function(s){ return s.exercise === name; });
+  if(!rows.length) return null;
+  var top = rows.reduce(function(a,b){ return wt(b) > wt(a) ? b : a; });
+  var sameW = rows.filter(function(s){ return wt(s) === wt(top); });
+  var mostReps = sameW.reduce(function(a,b){ return b.reps > a.reps ? b : a; });
+  return { weight: wt(top), reps: mostReps.reps, date: mostReps.date };
 }
 function renderProgressPicker(){
   var sel = $("progEx"), cur = sel.value;
@@ -768,34 +1030,62 @@ function seriesFor(name, metric){
   var byDate = {};
   state.sets.filter(function(s){ return s.exercise===name; }).forEach(function(s){
     var d = byDate[s.date] = byDate[s.date] || {date:s.date, top:0, e1rm:0, vol:0, sets:0, reps:0};
-    d.sets++; d.reps += s.reps; d.vol += s.weight*s.reps;
-    if(s.weight > d.top) d.top = s.weight;
-    var e = e1rm(s.weight, s.reps);
+    var w = wt(s);
+    d.sets++; d.reps += s.reps; d.vol += w*s.reps;
+    if(w > d.top){ d.top = w; d.topReps = s.reps; }
+    if(s.reps > (d.maxReps||0)) d.maxReps = s.reps;
+    var e = e1rm(w, s.reps);
     if(e > d.e1rm) d.e1rm = e;
   });
+  var bw = isBodyweight(name);
   return Object.keys(byDate).sort().map(function(k){
     var d = byDate[k];
-    d.value = metric==="vol" ? d.vol : metric==="e1rm" ? d.e1rm : d.top;
+    d.bodyweight = bw;
+    /* Unloaded work has no weight to plot, so reps carry the progress. */
+    d.value = bw ? (metric==="vol" ? d.reps : d.maxReps||0)
+                 : (metric==="vol" ? d.vol : metric==="e1rm" ? d.e1rm : d.top);
     return d;
   });
+}
+
+/* True when every set of this lift was logged without added weight. */
+function isBodyweight(name){
+  var rows = state.sets.filter(function(s){ return s.exercise === name; });
+  return rows.length > 0 && rows.every(function(s){ return !s.weight; });
 }
 function renderProgress(){
   var name = $("progEx").value, metric = $("progMetric").value;
   var data = name ? seriesFor(name, metric) : [];
   var best = name ? bestFor(name) : null;
-  $("pBest").textContent = best ? fmt(best.weight,1)+" "+state.unit : "—";
-  $("pE1rm").textContent = best ? fmt(e1rm(best.weight,best.reps),0)+" "+state.unit : "—";
+  var heavy = name ? heaviestFor(name) : null;
+  var bw = name ? isBodyweight(name) : false;
+  var bestReps = data.reduce(function(a,d){ return Math.max(a, d.maxReps||0); }, 0);
+  $("pBest").textContent = bw ? (bestReps ? bestReps + " reps" : "—")
+                              : (heavy ? fmt(heavy.weight,1)+" "+state.unit+" × "+heavy.reps : "—");
+  $("pE1rm").textContent = bw ? "bodyweight"
+                              : (best ? fmt(e1rm(best.weight,best.reps),0)+" "+state.unit : "—");
   $("pSessions").textContent = data.length;
-  var cut = new Date(Date.now() - 30*86400000).toISOString().slice(0,10);
-  var recent = data.filter(function(d){ return d.date >= cut; });
-  if(recent.length >= 2){
-    var delta = recent[recent.length-1].value - recent[0].value;
-    var pct = recent[0].value ? (delta/recent[0].value*100) : 0;
+  /* Compare the latest session with where you stood 30 days ago. The baseline is
+     the last session on or before the cutoff, so a single session inside the
+     window still has something honest to compare against. */
+  var cut = daysAgo(30);
+  var older = data.filter(function(d){ return d.date <= cut; });
+  var recent = data.filter(function(d){ return d.date > cut; });
+  var baseline = older.length ? older[older.length-1] : (recent.length > 1 ? recent[0] : null);
+  var latest = recent.length ? recent[recent.length-1] : null;
+  if(baseline && latest && baseline !== latest && baseline.value){
+    var delta = latest.value - baseline.value;
+    var pct = delta / baseline.value * 100;
     $("pTrend").textContent = (delta>=0?"+":"") + fmt(pct,1) + "%";
     $("pTrend").style.color = delta >= 0 ? "var(--good)" : "var(--danger)";
-  } else { $("pTrend").textContent = "—"; $("pTrend").style.color = ""; }
+    $("pTrend").title = "vs " + baseline.date;
+  } else {
+    $("pTrend").textContent = "—"; $("pTrend").style.color = "";
+    $("pTrend").title = recent.length || older.length ? "Needs two sessions 30 days apart" : "";
+  }
 
-  var label = metric==="vol" ? "Total volume ("+state.unit+")"
+  var label = bw ? (metric==="vol" ? "Total reps" : "Best set (reps)")
+            : metric==="vol" ? "Total volume ("+state.unit+")"
             : metric==="e1rm" ? "Estimated 1RM ("+state.unit+")"
             : "Heaviest set ("+state.unit+")";
   $("chartCaption").textContent = data.length
@@ -808,7 +1098,8 @@ function renderProgress(){
   if(!data.length){ t.appendChild(el("p","empty","Log some sets to see a breakdown.")); return; }
   var tbl = document.createElement("table");
   var thead = document.createElement("tr");
-  ["Date","Sets","Reps","Top set","Est. 1RM","Volume"].forEach(function(h,i){
+  (bw ? ["Date","Sets","Reps","Best set","Est. 1RM","Volume"]
+      : ["Date","Sets","Reps","Top set","Est. 1RM","Volume"]).forEach(function(h,i){
     var th = el("th", i>0 ? "num" : null, h); thead.appendChild(th);
   });
   tbl.appendChild(thead);
@@ -817,9 +1108,9 @@ function renderProgress(){
     tr.appendChild(el("td",null,d.date));
     tr.appendChild(el("td","num",String(d.sets)));
     tr.appendChild(el("td","num",String(d.reps)));
-    tr.appendChild(el("td","num",fmt(d.top,1)));
-    tr.appendChild(el("td","num",fmt(d.e1rm,0)));
-    tr.appendChild(el("td","num",fmt(d.vol,0)));
+    tr.appendChild(el("td","num", bw ? (d.maxReps||0) + " reps" : fmt(d.top,1)));
+    tr.appendChild(el("td","num", bw ? "—" : fmt(d.e1rm,0)));
+    tr.appendChild(el("td","num", bw ? String(d.reps) : fmt(d.vol,0)));
     tbl.appendChild(tr);
   });
   t.appendChild(tbl);
@@ -984,7 +1275,7 @@ function renderHistory(){
   var dates = Object.keys(byDate).sort().reverse();
   var totalVol = 0, weeks = {};
   state.sets.forEach(function(s){
-    totalVol += s.weight * s.reps;
+    totalVol += wt(s) * s.reps;
     weeks[s.date.slice(0,4) + "-" + Math.floor(new Date(s.date).getTime()/604800000)] = 1;
   });
   $("hSessions").textContent = dates.length;
@@ -998,7 +1289,7 @@ function renderHistory(){
   dates.slice(0,60).forEach(function(d){
     var rows = byDate[d];
     var card = el("div","card");
-    var vol = rows.reduce(function(a,s){ return a + s.weight*s.reps; },0);
+    var vol = rows.reduce(function(a,s){ return a + wt(s)*s.reps; },0);
     var head = el("div");
     head.style.display="flex"; head.style.gap="8px"; head.style.alignItems="baseline";
     var h = el("h2",null,d); h.style.flex="1"; h.style.margin="0";
@@ -1010,7 +1301,7 @@ function renderHistory(){
     Object.keys(byEx).forEach(function(n){
       var line = el("p","small");
       line.style.margin = "6px 0 0";
-      var parts = byEx[n].map(function(s){ return fmt(s.weight,1)+"×"+s.reps; }).join(", ");
+      var parts = byEx[n].map(function(s){ return fmt(wt(s),1)+"×"+s.reps; }).join(", ");
       var b = el("strong",null,n);
       line.appendChild(b);
       line.appendChild(document.createTextNode("  " + parts));
@@ -1735,15 +2026,15 @@ function prescribe(exName, targetSets, targetReps){
   var ds = Object.keys(dates).sort();
   var lastDate = ds[ds.length-1];
   var lastSets = hist.filter(function(s){ return s.date === lastDate; });
-  var w = lastSets.reduce(function(a,s){ return Math.max(a, s.weight); }, 0);
+  var w = lastSets.reduce(function(a,s){ return Math.max(a, wt(s)); }, 0);
   var allHit = lastSets.length >= targetSets &&
-               lastSets.filter(function(s){ return s.weight >= w; })
+               lastSets.filter(function(s){ return wt(s) >= w; })
                        .every(function(s){ return s.reps >= targetReps; });
 
   /* stall check: same top weight for 3+ sessions */
   var topByDate = ds.slice(-4).map(function(d){
     return hist.filter(function(s){ return s.date===d; })
-               .reduce(function(a,s){ return Math.max(a,s.weight); },0);
+               .reduce(function(a,s){ return Math.max(a,wt(s)); },0);
   });
   var stalled = topByDate.length >= 3 &&
                 topByDate.slice(-3).every(function(x){ return x === topByDate[topByDate.length-1]; });
@@ -1889,7 +2180,7 @@ function weeklyReview(){
   var wk = state.sets.filter(function(s){ return s.date >= cut; });
   if(!wk.length) return chatSay("Nothing logged in the last 7 days. No judgement — what got in the way?");
   var days = {}; wk.forEach(function(s){ days[s.date]=1; });
-  var vol = wk.reduce(function(a,s){ return a + s.weight*s.reps; },0);
+  var vol = wk.reduce(function(a,s){ return a + wt(s)*s.reps; },0);
   var prs = [];
   Object.keys(wk.reduce(function(a,s){ a[s.exercise]=1; return a; },{})).forEach(function(n){
     var b = bestFor(n);
@@ -2040,12 +2331,17 @@ function respond(text, t){
     return function(){
       if(!exF) return chatSay("Which lift? I'll pull up the demo and cues.");
       var rec = findExercise(exF);
-      if(rec && rec.instructions && rec.instructions.length){
+      if(rec){
         switchTab("exercises"); openExercise(rec);
-        return chatSay("Pulled up " + exF + " — demo and step-by-step are on screen. " +
-          "Watch the animation a few times; it beats any description I can type.");
+        if(rec.instructions && rec.instructions.length)
+          return chatSay("Pulled up " + exF + " — demo and step-by-step are on screen. " +
+            "Watch the animation a few times; it beats any description I can type.");
+        return chatSay("Pulled up " + exF + " — the demo host isn't reachable, so you'll see the muscle map " +
+          "and the key form cues for this movement instead.");
       }
-      chatSay("I don't have step-by-step for " + exF + " offline. Check the Exercises tab once the demo library loads.");
+      var cue = cuesFor(exF);
+      if(cue) return chatSay("Key cues for " + exF + ":\n• " + cue.join("\n• "));
+      chatSay("I don't have cues for " + exF + " — check the Exercises tab once the demo library loads.");
     };
   }
 
@@ -2162,9 +2458,9 @@ function respond(text, t){
       var rows2 = state.sets.filter(function(s){ return s.date===d; });
       if(!rows2.length) return chatSay("Nothing logged on " + d + ".");
       var byEx = {}, vol = 0;
-      rows2.forEach(function(s){ (byEx[s.exercise]=byEx[s.exercise]||[]).push(s); vol += s.weight*s.reps; });
+      rows2.forEach(function(s){ (byEx[s.exercise]=byEx[s.exercise]||[]).push(s); vol += wt(s)*s.reps; });
       var lines = Object.keys(byEx).map(function(n){
-        return [n, byEx[n].length, byEx[n].map(function(s){return fmt(s.weight,1)+"×"+s.reps;}).join(", ")];
+        return [n, byEx[n].length, byEx[n].map(function(s){return fmt(wt(s),1)+"×"+s.reps;}).join(", ")];
       });
       chatSay("On " + d + " you did " + rows2.length + " sets across " + lines.length +
         " exercises — " + fmt(vol,0) + " " + state.unit + " of total volume.",
@@ -2315,9 +2611,9 @@ function commitSets(exName, entries, unit, rpe, srcText, dateOverride){
     return s.exercise === name && ids.indexOf(s.id) < 0;
   });
   if(prior.length){
-    var prevBest = prior.reduce(function(a,b){ return e1rm(b.weight,b.reps) > e1rm(a.weight,a.reps) ? b : a; });
-    if(e1rm(topW,topR) > e1rm(prevBest.weight, prevBest.reps)){
-      msg += "\n\nThat's a personal best — beats " + fmt(prevBest.weight,1) + " " + state.unit +
+    var prevBest = prior.reduce(function(a,b){ return e1rm(wt(b),b.reps) > e1rm(wt(a),a.reps) ? b : a; });
+    if(e1rm(topW,topR) > e1rm(wt(prevBest), prevBest.reps)){
+      msg += "\n\nThat's a personal best — beats " + fmt(wt(prevBest),1) + " " + state.unit +
              " × " + prevBest.reps + " from " + prevBest.date + ".";
     } else {
       /* compare against the most recent session *before* the date being logged */
@@ -2327,16 +2623,16 @@ function commitSets(exName, entries, unit, rpe, srcText, dateOverride){
       var lastDate = earlier.length ? earlier[earlier.length-1].date : null;
       if(lastDate && lastDate !== date){
         var thatDay = prior.filter(function(s){ return s.date === lastDate; });
-        var topThen = thatDay.reduce(function(a,b){ return e1rm(b.weight,b.reps) > e1rm(a.weight,a.reps) ? b : a; });
+        var topThen = thatDay.reduce(function(a,b){ return e1rm(wt(b),b.reps) > e1rm(wt(a),a.reps) ? b : a; });
         msg += "\n\nLast " + name + " session (" + lastDate + "): " + thatDay.length + " sets, best " +
-               fmt(topThen.weight,1) + " " + state.unit + " × " + topThen.reps + ".";
+               fmt(wt(topThen),1) + " " + state.unit + " × " + topThen.reps + ".";
       }
     }
   } else {
     msg += "\n\nFirst time logging this one — that's your baseline.";
   }
   var dayVol = state.sets.filter(function(s){ return s.date===date; })
-                         .reduce(function(a,s){ return a + s.weight*s.reps; },0);
+                         .reduce(function(a,s){ return a + wt(s)*s.reps; },0);
   msg += "\nSession total for " + (backdated ? prettyDate(date) : "today") + ": " +
          fmt(dayVol,0) + " " + state.unit + " of volume.";
   if(backdated){
@@ -2586,6 +2882,10 @@ function init(){
     setTimeout(function(){
       if($("chatIn").scrollIntoView) $("chatIn").scrollIntoView({block:"center"});
     }, 250);
+  });
+  $("btnRetryLib").addEventListener("click", function(){
+    try{ localStorage.removeItem(LIB_KEY); }catch(e){}
+    fetchLibrary();
   });
   $("btnAddSet").addEventListener("click", addSet);
   $("btnRepeat").addEventListener("click", repeatLast);
